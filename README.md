@@ -392,12 +392,3 @@ Contributions are welcome! Please:
 4. Run `cargo fmt` and `cargo clippy`
 5. Submit a pull request
 
-## Roadmap / Future Features
-
-- [ ] Windows NTFS ISO support
-- [ ] macOS .dmg flashing
-- [ ] Verification (checksums, signature validation)
-- [ ] Configuration file support
-- [ ] Internationalization (i18n)
-- [ ] Built-in help/man pages
-- [ ] Performance optimizations (larger block sizes, parallelization)
