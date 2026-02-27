@@ -6,23 +6,24 @@ A fast, safe, and interactive TUI (Terminal User Interface) for flashing Linux O
 
 - **Interactive TUI** – Navigate and select images and devices with keyboard controls
 - **File picker** – Browse your entire filesystem to select ISO images
-- **Auto-detection** – Detects ISO type (hybrid/non-hybrid) for safe flashing
+- **Auto-detection** – Detects ISO type (hybrid/non-hybrid) without root privileges
 - **Progress tracking** – Real-time progress bar during flashing with byte count
 - **Device management** – Filter removable disks or show all disks
 - **Device labeling** – Auto-rename USB drive labels after flashing (FAT/NTFS/EXT)
 - **Dry-run mode** – Safe preview of what would flash (default)
-- **Linux-only ISOs** – Optimized for hybrid Linux ISOs (raw write with `dd`)
+- **Auto-elevation** – Automatically prompts for password via `pkexec`/`sudo` when flashing
+- **Linux ISOs** – Optimized for hybrid Linux ISOs (raw write with `dd`)
 
 ## Requirements
 
 ### System
 - **Linux** (tested on modern distributions)
 - **Rust** (1.70+) for building from source
-- **lsblk** – for device listing
-- **losetup** – for ISO type detection (requires root)
-- **dd** – for flashing (requires root/elevated privileges)
+- **lsblk** – for device listing (no root required)
+- **dd** – for flashing (root required; auto-elevated via `pkexec` or `sudo`)
 
-### Optional tools (for disk labeling)
+### Optional tools
+- `pkexec` or `sudo` – for automatic privilege elevation when flashing (if not running as root)
 - `fatlabel` – for FAT/VFAT labels
 - `ntfslabel` – for NTFS labels
 - `e2label` – for EXT2/3/4 labels
@@ -75,19 +76,24 @@ flashr-tui
 
 ### Examples
 
-**Dry-run (safe preview):**
+**Dry-run (safe preview, no root needed):**
 ```bash
-./target/debug/flashr-tui --image ~/Downloads/linux.iso --device /dev/sdb
+flashr-tui --image ~/Downloads/linux.iso --device /dev/sdb
 ```
 
-**With root (actually flash):**
+**Flash for real (auto-elevates via pkexec/sudo):**
 ```bash
-sudo ./target/release/flashr-tui --execute
+flashr-tui --image ~/Downloads/linux.iso --device /dev/sdb --execute
+```
+
+**Or run with sudo directly:**
+```bash
+sudo flashr-tui --execute
 ```
 
 **Pre-fill both image and device:**
 ```bash
-sudo ./target/release/flashr-tui --image ~/Downloads/nixos.iso --device /dev/sdb --execute
+flashr-tui --image ~/Downloads/nixos.iso --device /dev/sdb --execute
 ```
 
 ### TUI Controls
@@ -126,9 +132,10 @@ flashr-tui/
 │   ├── main.rs             # Entry point, CLI parsing, event loop
 │   ├── lib.rs              # Core app state and types
 │   ├── device.rs           # Device detection and listing (lsblk)
-│   ├── iso.rs              # ISO type detection (hybrid/non-hybrid)
-│   ├── flash.rs            # Flashing logic, progress streaming, labeling
-│   └── ui.rs               # All ratatui rendering and event handling
+│   ├── iso.rs              # ISO type detection (MBR/GPT byte reading)
+│   ├── flash.rs            # Flashing logic, privilege elevation, progress streaming, labeling
+│   ├── ui.rs               # All ratatui rendering and event handling
+│   └── logo.txt            # ASCII art logo (embedded at compile time)
 └── README.md               # This file
 ```
 
@@ -216,37 +223,46 @@ lsblk --json ─→ Parse JSON ─→ Filter disk type ─→ Filter by removabi
 
 **Key Types:**
 - **`IsoKind`** – Enum representing ISO type:
-  - `Unknown` – Unable to detect (usually no root privilege)
-  - `Hybrid` – Has partition table; safe to raw write with `dd`
+  - `Unknown` – Unable to detect (e.g., file too small)
+  - `Hybrid` – Has MBR/GPT partition table; safe to raw write with `dd`
   - `NonHybrid` – No partition table; cannot be flashed with raw write
 
 **Key Functions:**
 - `detect(image: &Path) -> Result<IsoKind>` – Main function:
-  - Uses `losetup --partscan` to mount ISO as loop device (requires root)
-  - Runs `lsblk` on loop device to check for child partitions
-  - Unmounts loop device
-  - Returns `Hybrid` if partitions found, else `NonHybrid`
+  - Reads the first 520 bytes of the ISO file
+  - Checks for MBR boot signature (`0x55 0xAA`) at bytes 510-511
+  - Checks for non-zero MBR partition entries at bytes 446-509
+  - Checks for GPT header (`EFI PART`) at bytes 512-519
+  - Returns `Hybrid` if partition table found, else `NonHybrid`
+  - **No root privileges required** — only needs read access to the file
 
 **How it Works:**
 ```
-losetup --find --show --partscan <ISO> ─→ Mount as loop device
-                                           │
-                                           ├─→ lsblk to check for partitions
-                                           │
-                                ──────────→ losetup -d to unmount
-                                           │
-                                           └─→ Return Hybrid/NonHybrid
+Read first 520 bytes of ISO file
+  │
+  ├─→ Check bytes 510-511 for MBR signature (0x55 0xAA)
+  ├─→ Check bytes 446-509 for non-zero partition entries
+  ├─→ Check bytes 512-519 for GPT header ("EFI PART")
+  │
+  └─→ Return Hybrid (if MBR+partitions or GPT) / NonHybrid
 ```
 
 ### [src/flash.rs](src/flash.rs) – Flashing Logic (150+ lines)
 
-**Purpose:** Actually flash ISO to device, stream progress, and label the drive.
+**Purpose:** Actually flash ISO to device, stream progress, and label the drive. Automatically elevates privileges via `pkexec` or `sudo` when not running as root.
 
 **Key Functions:**
 
-- **`flash_image_with_progress(image: &Path, device: &str, progress: Sender<String>) -> Result<()`**
+- **`is_root() -> bool`**
+  - Checks if the current process is running as root (euid == 0)
+
+- **`find_elevator() -> Option<&'static str>`**
+  - Finds an available privilege elevation tool (`pkexec` first, then `sudo`)
+
+- **`flash_image_with_progress(image: &Path, device: &str, progress: Sender<String>) -> Result<()>`**
   - Main flashing function (called in background thread)
   - Validates ISO type
+  - If not root, finds an elevator and wraps privileged commands with it
   - Spawns `dd` process with pipes for streaming progress
   - Reads `stderr` line-by-line (dd outputs progress to stderr)
   - Sends progress updates through channel
@@ -257,10 +273,10 @@ losetup --find --show --partscan <ISO> ─→ Mount as loop device
   - Extracts byte count from dd output
   - Parses lines like "1234567 bytes" to get progress number
 
-- **`label_device_from_iso(image: &Path, device: &str) -> Result<Option<String>>`**
+- **`label_device_from_iso(image: &Path, device: &str, elevator: Option<&str>) -> Result<Option<String>>`**
   - Extracts ISO filename (e.g., "nixos-24.04.iso" → "nixos-24-04")
   - Queries `lsblk` to find first writable filesystem on device
-  - Calls appropriate label tool based on filesystem type:
+  - Calls appropriate label tool (elevated if needed) based on filesystem type:
     - FAT → `fatlabel` (11 char max)
     - NTFS → `ntfslabel` (32 char max)
     - EXT → `e2label` (16 char max)
@@ -279,11 +295,11 @@ losetup --find --show --partscan <ISO> ─→ Mount as loop device
 
 **How it Works:**
 ```
-dd if=image.iso of=/dev/sdb bs=4M status=progress oflag=sync
+[pkexec/sudo] dd if=image.iso of=/dev/sdb bs=4M status=progress oflag=sync
   │
   ├─→ Capture stderr ─→ Parse progress bytes ─→ Send via channel
   │
-  └─→ Wait for completion ─→ partprobe /dev/sdb ─→ Label device
+  └─→ Wait for completion ─→ [pkexec/sudo] partprobe ─→ [pkexec/sudo] Label device
 ```
 
 ### [src/ui.rs](src/ui.rs) – User Interface (15K+ lines)
@@ -328,10 +344,11 @@ Currently, all features are built-in with no config file. Future enhancements co
 
 ## Troubleshooting
 
-### ISO detection fails: "losetup failed; need root for ISO inspection"
-**Solution:** Run with `sudo`:
+### Flash fails: "Root privileges required for flashing"
+**Cause:** Neither `pkexec` nor `sudo` was found on the system.
+**Solution:** Install one of them, or run directly with sudo:
 ```bash
-sudo ./target/release/flashr-tui --execute
+sudo flashr-tui --execute
 ```
 
 ### No USB devices appear
@@ -342,8 +359,8 @@ sudo ./target/release/flashr-tui --execute
 
 ### Labeling fails: "Labeling tool not available"
 **Solution:** Install the appropriate tool:
-- FAT: `sudo apt install dosfstools` (includes `fatlabel`)
-- NTFS: `sudo apt install ntfs-3g`
+- FAT: `sudo pacman -S dosfstools` (includes `fatlabel`)
+- NTFS: `sudo pacman -S ntfs-3g`
 - EXT: Usually built-in; check `e2fsprogs` package
 
 ### Flash takes too long / seems stuck
@@ -378,6 +395,7 @@ cargo fmt             # Format code
 | `serde` | 1.0 | JSON deserialization |
 | `serde_json` | 1.0 | JSON parsing |
 | `anyhow` | 1.0 | Error handling |
+| `libc` | 0.2 | Root detection (geteuid) |
 
 ## License
 
