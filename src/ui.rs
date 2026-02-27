@@ -11,6 +11,9 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::{App, AppExit, Step};
 
+/// ASCII art logo for the title banner, loaded from logo.txt at compile time.
+const LOGO: &str = include_str!("logo.txt");
+
 /// Handle a keyboard event for the current step.
 ///
 /// Routes the event to the appropriate step handler.
@@ -228,19 +231,19 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(7),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
-    let title = Paragraph::new("Flashr")
+    let title = Paragraph::new(LOGO)
         .style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
-        .block(Block::default().borders(Borders::ALL).title("flashr-tui"));
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(title, chunks[0]);
 
     match app.step {
