@@ -234,7 +234,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         ])
         .split(frame.area());
 
-    let title = Paragraph::new("Flashr TUI MVP")
+    let title = Paragraph::new("Flashr")
         .style(
             Style::default()
                 .fg(Color::Cyan)
