@@ -86,7 +86,8 @@ pub fn list(show_all: bool) -> Result<Vec<Disk>> {
         return Err(anyhow::anyhow!("lsblk failed: {stderr}"));
     }
 
-    let parsed: LsblkOutput = serde_json::from_slice(&output.stdout).context("parse lsblk output")?;
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("parse lsblk output")?;
 
     let disks = parsed
         .blockdevices

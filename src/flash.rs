@@ -2,6 +2,9 @@
 //!
 //! This module handles the actual flashing operation using `dd`, streams progress updates
 //! through an mpsc channel, and optionally labels the USB drive based on the ISO filename.
+//!
+//! When not running as root, privileged commands (`dd`, `partprobe`, labeling tools)
+//! are automatically wrapped with `pkexec` or `sudo` for privilege elevation.
 
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -12,6 +15,59 @@ use std::sync::mpsc;
 use crate::device::LsblkOutput;
 use crate::iso::IsoKind;
 
+/// Check if the current process is running as root (euid == 0).
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Find an available privilege elevation tool.
+///
+/// Checks for `pkexec` first (graphical prompt on desktop systems),
+/// then falls back to `sudo` (terminal prompt).
+///
+/// # Returns
+///
+/// `Some("pkexec")` or `Some("sudo")` if found, `None` if neither is available.
+pub fn find_elevator() -> Option<&'static str> {
+    for tool in &["pkexec", "sudo"] {
+        if Command::new("which")
+            .arg(tool)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(tool);
+        }
+    }
+    None
+}
+
+/// Build a `Command` that runs a program with privilege elevation if needed.
+///
+/// If already root, returns `Command::new(program)` directly.
+/// If not root, wraps the command with the given elevator (e.g., `pkexec` or `sudo`).
+///
+/// # Arguments
+///
+/// * `program` - The program to run (e.g., "dd", "partprobe")
+/// * `elevator` - Optional elevator tool name (e.g., "pkexec", "sudo")
+///
+/// # Returns
+///
+/// A `Command` ready for argument addition and execution.
+fn elevated_command(program: &str, elevator: Option<&str>) -> Command {
+    match elevator {
+        Some(elev) if !is_root() => {
+            let mut cmd = Command::new(elev);
+            cmd.arg(program);
+            cmd
+        }
+        _ => Command::new(program),
+    }
+}
+
 /// Flash an ISO image to a USB device with live progress streaming.
 ///
 /// This function:
@@ -21,6 +77,9 @@ use crate::iso::IsoKind;
 /// 4. Waits for `dd` to complete and validates success
 /// 5. Refreshes the kernel's partition table with `partprobe`
 /// 6. Attempts to label the device based on ISO filename
+///
+/// When not running as root, `dd` and post-flash commands are automatically
+/// elevated via `pkexec` or `sudo`.
 ///
 /// # Arguments
 ///
@@ -35,7 +94,8 @@ use crate::iso::IsoKind;
 /// # Errors
 ///
 /// Returns an error if:
-/// - ISO is NonHybrid or type cannot be determined (no root)
+/// - ISO is NonHybrid or type cannot be determined
+/// - No privilege elevation tool is available when not running as root
 /// - `dd` command fails to execute or returns non-zero
 /// - Reading progress from `dd` fails
 ///
@@ -55,13 +115,28 @@ pub fn flash_image_with_progress(
             ));
         }
         IsoKind::Unknown => {
-            return Err(anyhow::anyhow!(
-                "Unable to determine ISO type; run as root"
-            ));
+            return Err(anyhow::anyhow!("Unable to determine ISO type"));
         }
     }
 
-    let mut child = Command::new("dd")
+    // Find an elevator if we're not root
+    let elevator = if is_root() {
+        None
+    } else {
+        let elev = find_elevator().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Root privileges required for flashing. \
+                 Install pkexec or sudo, or run with: sudo flashr-tui --execute"
+            )
+        })?;
+        let _ = progress.send(format!(
+            "Not running as root; using '{}' for privilege elevation",
+            elev
+        ));
+        Some(elev)
+    };
+
+    let mut child = elevated_command("dd", elevator)
         .arg(format!("if={}", image.display()))
         .arg(format!("of={}", device))
         .arg("bs=4M")
@@ -70,7 +145,7 @@ pub fn flash_image_with_progress(
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
-        .context("run dd")?;
+        .context("run dd (do you have permission?)")?;
 
     if let Some(mut stderr) = child.stderr.take() {
         let mut buf = [0u8; 4096];
@@ -107,8 +182,9 @@ pub fn flash_image_with_progress(
 
     Command::new("sync").status().ok();
 
-    let _ = Command::new("partprobe").arg(device).status();
-    if let Ok(Some(message)) = label_device_from_iso(image, device) {
+    let _ = elevated_command("partprobe", elevator).arg(device).status();
+
+    if let Ok(Some(message)) = label_device_from_iso(image, device, elevator) {
         let _ = progress.send(message);
     }
 
@@ -153,12 +229,17 @@ pub fn parse_dd_bytes(line: &str) -> Option<u64> {
 ///
 /// * `image` - Path to the ISO file
 /// * `device` - Device path (e.g., "/dev/sdb")
+/// * `elevator` - Optional privilege elevation tool (e.g., "pkexec", "sudo")
 ///
 /// # Returns
 ///
 /// `Ok(Some(message))` with a success or error message, or `Ok(None)` if no suitable partition found.
 /// Errors are non-fatal and reported as messages.
-fn label_device_from_iso(image: &Path, device: &str) -> Result<Option<String>> {
+fn label_device_from_iso(
+    image: &Path,
+    device: &str,
+    elevator: Option<&str>,
+) -> Result<Option<String>> {
     let Some(label_base) = image.file_stem().and_then(|s| s.to_str()) else {
         return Ok(None);
     };
@@ -198,8 +279,8 @@ fn label_device_from_iso(image: &Path, device: &str) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    let (label, tool, args) = label_command(&partition, &fstype, &label_base);
-    let status = Command::new(tool).args(args).status();
+    let (label, tool, extra_args) = label_command(&partition, &fstype, &label_base);
+    let status = elevated_command(tool, elevator).args(extra_args).status();
     match status {
         Ok(status) if status.success() => Ok(Some(format!("Label set to {label}"))),
         Ok(_) => Ok(Some("Labeling failed".to_string())),
@@ -258,11 +339,19 @@ fn label_command<'a>(
     match fstype {
         "vfat" | "fat" | "fat16" | "fat32" => {
             let label = truncate_label(base, 11);
-            (label.clone(), "fatlabel", vec![partition.to_string(), label])
+            (
+                label.clone(),
+                "fatlabel",
+                vec![partition.to_string(), label],
+            )
         }
         "ntfs" => {
             let label = truncate_label(base, 32);
-            (label.clone(), "ntfslabel", vec![partition.to_string(), label])
+            (
+                label.clone(),
+                "ntfslabel",
+                vec![partition.to_string(), label],
+            )
         }
         "ext2" | "ext3" | "ext4" => {
             let label = truncate_label(base, 16);

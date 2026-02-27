@@ -138,7 +138,12 @@ impl App {
     /// # Returns
     ///
     /// A new App with initial step either at Image (if no image given) or Device (if image provided).
-    pub fn new(image: Option<PathBuf>, device: Option<String>, execute: bool, devices: Vec<Disk>) -> Self {
+    pub fn new(
+        image: Option<PathBuf>,
+        device: Option<String>,
+        execute: bool,
+        devices: Vec<Disk>,
+    ) -> Self {
         let mut selected_device = None;
         let mut selected = 0;
 
@@ -237,11 +242,12 @@ impl App {
 
     /// Detect the ISO type (Hybrid/NonHybrid) of the selected image.
     ///
-    /// Uses `iso::detect()` which requires `losetup` (typically requires root).
+    /// Reads the MBR header of the ISO file to check for a partition table.
     /// Updates `iso_kind` and `iso_info` with the result or error message.
     ///
     /// # Note
     ///
+    /// This operation requires only read access to the file — no root privileges needed.
     /// If `iso_kind` is `NonHybrid`, the flash operation will be blocked in the `Confirm` step.
     pub fn refresh_iso_kind(&mut self) {
         let Some(path) = self.image_path() else {

@@ -171,7 +171,9 @@ fn handle_confirm_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
             if app.iso_kind == crate::iso::IsoKind::NonHybrid {
                 app.status = "ISO has no partition table; hybrid ISO required.".to_string();
                 app.step = Step::Error;
-            } else if let (Some(image), Some(device)) = (app.image_path(), app.selected_device.clone()) {
+            } else if let (Some(image), Some(device)) =
+                (app.image_path(), app.selected_device.clone())
+            {
                 if app.execute {
                     app.start_flash(image, device.device_path());
                 } else {
@@ -233,7 +235,11 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         .split(frame.area());
 
     let title = Paragraph::new("Flashr TUI MVP")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(Block::default().borders(Borders::ALL).title("flashr-tui"));
     frame.render_widget(title, chunks[0]);
 
@@ -268,7 +274,9 @@ fn draw_image_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
     ]);
 
     let block = Block::default().borders(Borders::ALL).title("Image");
-    let paragraph = Paragraph::new(header).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(header)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, sections[0]);
 
     let items: Vec<ListItem> = app
@@ -303,7 +311,9 @@ fn draw_device_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
             Line::from("No devices detected."),
             Line::from("Press 'r' to rescan or 'a' to show all disks."),
         ]);
-        let block = Block::default().borders(Borders::ALL).title("Select Device");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Select Device");
         let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
         return;
@@ -328,7 +338,11 @@ fn draw_device_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Select Device"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Select Device"),
+        )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("> ");
 
@@ -348,11 +362,7 @@ fn draw_confirm_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layou
         .map(|d| d.device_path())
         .unwrap_or_else(|| "<none>".to_string());
 
-    let mode = if app.execute {
-        "EXECUTE"
-    } else {
-        "DRY RUN"
-    };
+    let mode = if app.execute { "EXECUTE" } else { "DRY RUN" };
 
     let text = Text::from(vec![
         Line::from("Step 3: Confirm"),
@@ -392,7 +402,9 @@ fn draw_flashing_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
     ]);
 
     let block = Block::default().borders(Borders::ALL).title("Flashing");
-    let paragraph = Paragraph::new(header).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(header)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, sections[0]);
 
     let gauge = Gauge::default()
@@ -406,8 +418,16 @@ fn draw_flashing_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
 fn draw_result_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let result = app.flash_result.as_ref();
     let (title, style, message) = match result {
-        Some(result) if result.ok => ("Success", Style::default().fg(Color::Green), result.message.as_str()),
-        Some(result) => ("Failed", Style::default().fg(Color::Red), result.message.as_str()),
+        Some(result) if result.ok => (
+            "Success",
+            Style::default().fg(Color::Green),
+            result.message.as_str(),
+        ),
+        Some(result) => (
+            "Failed",
+            Style::default().fg(Color::Red),
+            result.message.as_str(),
+        ),
         None => ("Result", Style::default().fg(Color::Gray), "No result."),
     };
 
@@ -461,7 +481,7 @@ fn iso_info_line(app: &App) -> String {
         match app.iso_kind {
             crate::iso::IsoKind::Hybrid => "Hybrid ISO detected (raw write).".to_string(),
             crate::iso::IsoKind::NonHybrid => "Non-hybrid ISO (unsupported).".to_string(),
-            crate::iso::IsoKind::Unknown => "Unknown (run as root for detection).".to_string(),
+            crate::iso::IsoKind::Unknown => "Unknown ISO type.".to_string(),
         }
     } else {
         app.iso_info.clone()
