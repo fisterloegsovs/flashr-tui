@@ -51,6 +51,10 @@ pub(crate) struct LsblkDevice {
     #[serde(default)]
     pub fstype: Option<String>,
     #[serde(default)]
+    pub mountpoint: Option<String>,
+    #[serde(default)]
+    pub mountpoints: Option<Vec<Option<String>>>,
+    #[serde(default)]
     pub children: Vec<LsblkDevice>,
 }
 

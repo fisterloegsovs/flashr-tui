@@ -29,6 +29,10 @@ const LOGO: &str = include_str!("logo.txt");
 /// `Some(AppExit)` to exit the application, `None` to continue running.
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<AppExit> {
     if key.code == KeyCode::Char('q') {
+        if app.step == Step::Flashing {
+            app.status = "Cannot quit while flashing is in progress.".to_string();
+            return None;
+        }
         return Some(AppExit::Quit);
     }
 
@@ -231,16 +235,16 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
     let title = Paragraph::new(LOGO)
         .style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )
         .block(Block::default().borders(Borders::ALL));
@@ -463,7 +467,7 @@ fn status_line(app: &App) -> Line<'static> {
         Step::Image => "Up/Down=select  Enter=open/select  Backspace=up  Ctrl+U=clear  q=quit",
         Step::Device => "Up/Down=select  Enter=next  r=rescan  a=all  b=back  q=quit",
         Step::Confirm => "f=flash  b=back  q=quit",
-        Step::Flashing => "Flashing...  q=quit",
+        Step::Flashing => "Flashing... please wait",
         Step::Result | Step::Error => "q=quit",
     };
 

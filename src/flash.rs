@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::io::Read;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
@@ -29,19 +30,15 @@ pub fn is_root() -> bool {
 ///
 /// `Some("pkexec")` or `Some("sudo")` if found, `None` if neither is available.
 pub fn find_elevator() -> Option<&'static str> {
-    for tool in &["pkexec", "sudo"] {
-        if Command::new("which")
+    ["pkexec", "sudo"].into_iter().find(|tool| {
+        Command::new("which")
             .arg(tool)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
-        {
-            return Some(tool);
-        }
-    }
-    None
+    })
 }
 
 /// Build a `Command` that runs a program with privilege elevation if needed.
@@ -118,6 +115,8 @@ pub fn flash_image_with_progress(
             return Err(anyhow::anyhow!("Unable to determine ISO type"));
         }
     }
+
+    ensure_device_safe(device)?;
 
     // Find an elevator if we're not root
     let elevator = if is_root() {
@@ -250,7 +249,7 @@ fn label_device_from_iso(
     }
 
     let output = Command::new("lsblk")
-        .args(["--json", "-o", "NAME,FSTYPE", "-p", device])
+        .args(["--json", "-o", "NAME,FSTYPE,TYPE", "-p", device])
         .output()
         .context("run lsblk for fstype")?;
 
@@ -267,7 +266,7 @@ fn label_device_from_iso(
             for child in dev.children {
                 if let Some(fstype) = child.fstype.clone() {
                     if is_supported_fstype(&fstype) {
-                        target = Some((format!("/dev/{}", child.name), fstype));
+                        target = Some((child.name, fstype));
                         break;
                     }
                 }
@@ -285,6 +284,82 @@ fn label_device_from_iso(
         Ok(status) if status.success() => Ok(Some(format!("Label set to {label}"))),
         Ok(_) => Ok(Some("Labeling failed".to_string())),
         Err(_) => Ok(Some("Labeling tool not available".to_string())),
+    }
+}
+
+fn ensure_device_safe(device: &str) -> Result<()> {
+    let meta = std::fs::metadata(device)
+        .with_context(|| format!("target device not found: {device}"))?;
+    if !meta.file_type().is_block_device() {
+        return Err(anyhow::anyhow!("target is not a block device: {device}"));
+    }
+
+    let output = Command::new("lsblk")
+        .args([
+            "--json",
+            "-o",
+            "NAME,TYPE,MOUNTPOINT,MOUNTPOINTS",
+            "-p",
+            device,
+        ])
+        .output()
+        .context("run lsblk for mount safety checks")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            "lsblk failed for mount safety checks".to_string()
+        } else {
+            format!("lsblk failed for mount safety checks: {stderr}")
+        };
+        return Err(anyhow::anyhow!(message));
+    }
+
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("parse lsblk mount safety output")?;
+
+    let mut mounts = Vec::new();
+    for dev in &parsed.blockdevices {
+        collect_mountpoints(dev, &mut mounts);
+    }
+
+    if mounts.iter().any(|m| m == "/") {
+        return Err(anyhow::anyhow!(
+            "Refusing to flash device containing the root filesystem (/)."
+        ));
+    }
+
+    if !mounts.is_empty() {
+        let preview = mounts
+            .into_iter()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow::anyhow!(
+            "Target device has mounted filesystems ({preview}). Unmount all partitions before flashing."
+        ));
+    }
+
+    Ok(())
+}
+
+fn collect_mountpoints(dev: &crate::device::LsblkDevice, mounts: &mut Vec<String>) {
+    if let Some(mp) = &dev.mountpoint {
+        if !mp.is_empty() && mp != "[SWAP]" {
+            mounts.push(mp.clone());
+        }
+    }
+
+    if let Some(list) = &dev.mountpoints {
+        for item in list.iter().flatten() {
+            if !item.is_empty() && item != "[SWAP]" {
+                mounts.push(item.clone());
+            }
+        }
+    }
+
+    for child in &dev.children {
+        collect_mountpoints(child, mounts);
     }
 }
 

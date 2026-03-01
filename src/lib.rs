@@ -162,21 +162,27 @@ impl App {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
+        let image_valid = image.as_ref().map(|p| p.is_file()).unwrap_or(false);
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let entries = load_entries(&cwd);
 
-        let step = if !image_input.is_empty() {
+        let step = if image_valid {
             Step::Device
         } else {
             Step::Image
         };
 
-        let status = if devices.is_empty() {
-            "No devices detected. Press r to rescan or a to show all.".to_string()
-        } else {
-            String::new()
-        };
+        let mut status = String::new();
+        if image.is_some() && !image_valid {
+            status.push_str("Provided --image path must point to an existing file.");
+        }
+        if devices.is_empty() {
+            if !status.is_empty() {
+                status.push_str("  ");
+            }
+            status.push_str("No devices detected. Press r to rescan or a to show all.");
+        }
 
         Self {
             step,
