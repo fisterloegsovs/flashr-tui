@@ -99,3 +99,67 @@ pub fn detect(image: &Path) -> Result<IsoKind> {
         Ok(IsoKind::NonHybrid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_file(content: &[u8]) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "flashr_tui_iso_test_{}_{}.img",
+            std::process::id(),
+            nanos
+        ));
+
+        let mut file = std::fs::File::create(&path).expect("create temp file");
+        file.write_all(content).expect("write temp content");
+        path
+    }
+
+    #[test]
+    fn detect_returns_unknown_for_small_file() {
+        let path = write_temp_file(&[0u8; 128]);
+        let result = detect(&path).expect("detect should succeed");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result, IsoKind::Unknown);
+    }
+
+    #[test]
+    fn detect_returns_nonhybrid_without_signatures() {
+        let path = write_temp_file(&[0u8; 520]);
+        let result = detect(&path).expect("detect should succeed");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result, IsoKind::NonHybrid);
+    }
+
+    #[test]
+    fn detect_returns_hybrid_for_mbr_signature_and_partition() {
+        let mut buf = [0u8; 520];
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+        buf[446] = 0x01;
+        let path = write_temp_file(&buf);
+
+        let result = detect(&path).expect("detect should succeed");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result, IsoKind::Hybrid);
+    }
+
+    #[test]
+    fn detect_returns_hybrid_for_gpt_magic() {
+        let mut buf = [0u8; 520];
+        buf[512..520].copy_from_slice(b"EFI PART");
+        let path = write_temp_file(&buf);
+
+        let result = detect(&path).expect("detect should succeed");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(result, IsoKind::Hybrid);
+    }
+}

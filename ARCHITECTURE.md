@@ -46,9 +46,9 @@ This document provides an in-depth look at flashr-tui's design, data flow, and i
                                        ▼
                               ┌──────────────────┐
                               │  iso.rs          │
-                              │ • losetup mount  │
+                              │ • Header read    │
+                              │ • MBR/GPT check  │
                               │ • Type detection │
-                              │ • Partition check│
                               └──────────────────┘
 ```
 
@@ -92,22 +92,25 @@ pub struct App {
     pub image_input: String,           // User-entered path or filename search
     pub cwd: PathBuf,                  // Current working directory for file picker
     pub entries: Vec<FileEntry>,       // Files/dirs in cwd
-    pub validated_image: Option<PathBuf>, // Validated image path
-    pub iso_kind: Option<IsoKind>,     // Detected ISO type (if image selected)
+    pub entry_selected: usize,         // Selected index in entries
+    pub iso_kind: IsoKind,             // Detected ISO type
+    pub iso_info: String,              // ISO detection status text
     
     // Device selection state
     pub devices: Vec<Disk>,            // List of available devices
-    pub selected_device: Option<usize>, // Index into devices list
+    pub selected: usize,               // Selected index in devices list
+    pub selected_device: Option<Disk>, // Selected disk details
+    pub status: String,                // Footer status/error message
     pub show_all_disks: bool,          // Toggle between removable-only vs all disks
     
     // Flashing state
     pub execute: bool,                 // Dry-run vs actual flash mode
     pub flash_progress: String,        // Current progress message
+    pub flash_result: Option<FlashResult>, // Final flash result
+    pub flash_total: Option<u64>,      // Total bytes (for progress bar)
+    pub flash_done: u64,               // Bytes written so far
     pub progress_rx: Option<Receiver<String>>, // Channel from flash thread
-    pub result_rx: Option<Receiver<FlashResult>>, // Result from flash thread
-    
-    // Error handling
-    pub error_message: Option<String>, // Non-terminal errors
+    pub result_rx: Option<Receiver<Result<(), String>>>, // Result from flash thread
 }
 ```
 
@@ -134,12 +137,13 @@ pub struct Disk {
 }
 ```
 
-### FileEntry Enum
+### FileEntry Struct
 
 ```rust
-pub enum FileEntry {
-    Dir { name: String },
-    File { name: String },
+pub struct FileEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
 }
 ```
 
@@ -198,19 +202,14 @@ ui::handle_key() → Image step
        │   │
        │   └─→ iso::detect(image_path)
        │       │
-       │       ├─→ Execute: losetup --find --show --partscan <image>
-       │       │   Returns: "/dev/loop0"
-       │       │
-       │       ├─→ Execute: lsblk --json /dev/loop0
-       │       │   Checks if loop device has "children" (partitions)
-       │       │
-       │       ├─→ Execute: losetup -d /dev/loop0
-       │       │   Unmount loop device
-       │       │
+       │       ├─→ Read first 520 bytes from image
+       │       ├─→ Check MBR signature (bytes 510-511)
+       │       ├─→ Check MBR partition entries (bytes 446-509)
+       │       ├─→ Check GPT magic "EFI PART" (bytes 512-519)
        │       └─→ Return:
-       │           • Hybrid if children exist
-       │           • NonHybrid if no children
-       │           • Unknown if losetup fails (no root)
+       │           • Hybrid if MBR+partitions or GPT
+       │           • NonHybrid if no partition table detected
+       │           • Unknown if file too small (<512 bytes)
        │
        └─→ Store Result in App::iso_kind
 ```
@@ -218,16 +217,16 @@ ui::handle_key() → Image step
 **Partition Detection Logic:**
 ```rust
 fn detect(image: &Path) -> Result<IsoKind> {
-    // losetup mounts ISO as loop device
-    let loop_dev = losetup mount image?;
-    
-    // Check if loop device has partitions (children)
-    let output = lsblk --json <loop_dev>?;
-    let has_children = output.blockdevices[0].children.is_some();
-    
-    losetup unmount <loop_dev>?;
-    
-    Ok(if has_children { Hybrid } else { NonHybrid })
+    let mut header = [0u8; 520];
+    let bytes_read = read_header(image, &mut header)?;
+    if bytes_read < 512 {
+        return Ok(Unknown);
+    }
+
+    let has_mbr = has_mbr_signature_and_partition_entry(&header);
+    let has_gpt = bytes_read >= 520 && &header[512..520] == b"EFI PART";
+
+    Ok(if has_mbr || has_gpt { Hybrid } else { NonHybrid })
 }
 ```
 
@@ -323,9 +322,7 @@ fn run_command(cmd: &str, args: &[&str]) -> Result<String> {
 
 **Example calls:**
 - `lsblk --json` – Device listing
-- `losetup --find --show --partscan image.iso` – Mount ISO
-- `lsblk --json /dev/loop0` – Check loop device partitions
-- `losetup -d /dev/loop0` – Unmount ISO
+- `lsblk --json -o NAME,TYPE,MOUNTPOINT,MOUNTPOINTS -p /dev/sdX` – Pre-flash safety checks
 - `dd if=image of=/dev/sdb status=progress` – Flash to device
 - `partprobe /dev/sdb` – Refresh partition table
 - `fatlabel /dev/sdb1 label` – Set label
@@ -466,9 +463,10 @@ dd if=<image> of=<device> bs=4M status=progress oflag=sync
 | Scenario | Handling |
 |----------|----------|
 | ISO file is very small | Still flashes (no size validation) |
-| Device is root FS | Allowed (no safety check); user responsibility |
+| Device is root FS | Blocked; flashing refuses root filesystem device |
+| Device has mounted partitions | Blocked; requires unmount before flashing |
 | Device disconnected mid-flash | dd fails; error shown in Result |
-| losetup unavailable | IsoKind = Unknown; flash allowed with warning |
+| Header read fails | IsoKind set to Unknown; flashing blocked |
 | No label tools installed | Flash succeeds; label skipped silently |
 | User cancels (Ctrl+C) | Terminal cleanup & restore (crossterm leaves) |
 
@@ -504,11 +502,12 @@ dd if=<image> of=<device> bs=4M status=progress oflag=sync
 
 ## Security Considerations
 
-1. **Root privilege**: losetup and dd require root; user must run with sudo
+1. **Root privilege**: dd requires root or elevation via pkexec/sudo
 2. **Device access**: Direct access to `/dev/*`; no permission isolation
-3. **Input validation**: ISO paths validated; no injection vulnerability
+3. **Input validation**: ISO path and target block-device checks are enforced
 4. **Command injection**: All commands use `Command::new()` with array args (safe)
-5. **Data integrity**: dd with `oflag=sync` ensures writes are durable
+5. **Safety guards**: Refuses mounted targets and root filesystem devices
+6. **Data integrity**: dd with `oflag=sync` ensures writes are durable
 
 ## Deployment & Packaging
 

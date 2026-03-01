@@ -442,3 +442,68 @@ fn label_command<'a>(
 fn truncate_label(input: &str, max_len: usize) -> String {
     input.chars().take(max_len).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dd_bytes_reads_leading_number() {
+        let line = "123456789 bytes (123 MB) copied, 1 s, 123 MB/s";
+        assert_eq!(parse_dd_bytes(line), Some(123_456_789));
+    }
+
+    #[test]
+    fn parse_dd_bytes_returns_none_without_leading_digits() {
+        assert_eq!(parse_dd_bytes("dd: failed to open"), None);
+    }
+
+    #[test]
+    fn sanitize_label_keeps_supported_chars() {
+        let input = "Fedora Linux 40 (Beta)!";
+        assert_eq!(sanitize_label(input), "Fedora_Linux_40_Beta");
+    }
+
+    #[test]
+    fn truncate_label_uses_char_boundaries() {
+        assert_eq!(truncate_label("abcdef", 3), "abc");
+        assert_eq!(truncate_label("åäö", 2), "åä");
+    }
+
+    #[test]
+    fn label_command_uses_partition_path_as_is() {
+        let (label, tool, args) = label_command("/dev/sdb1", "ext4", "ubuntu_live");
+        assert_eq!(label, "ubuntu_live");
+        assert_eq!(tool, "e2label");
+        assert_eq!(args, vec!["/dev/sdb1", "ubuntu_live"]);
+    }
+
+    #[test]
+    fn collect_mountpoints_reads_nested_entries() {
+        let tree = crate::device::LsblkDevice {
+            name: "/dev/sdb".to_string(),
+            model: None,
+            size: None,
+            rm: None,
+            r#type: "disk".to_string(),
+            fstype: None,
+            mountpoint: None,
+            mountpoints: None,
+            children: vec![crate::device::LsblkDevice {
+                name: "/dev/sdb1".to_string(),
+                model: None,
+                size: None,
+                rm: None,
+                r#type: "part".to_string(),
+                fstype: Some("ext4".to_string()),
+                mountpoint: Some("/media/usb".to_string()),
+                mountpoints: Some(vec![Some("/media/usb".to_string()), Some("".to_string())]),
+                children: Vec::new(),
+            }],
+        };
+
+        let mut mounts = Vec::new();
+        collect_mountpoints(&tree, &mut mounts);
+        assert!(mounts.iter().any(|m| m == "/media/usb"));
+    }
+}
