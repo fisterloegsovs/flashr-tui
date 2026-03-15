@@ -34,11 +34,12 @@ pub struct FileEntry {
 /// 1. `Image` - User selects an ISO file via file picker
 /// 2. `Device` - User selects a target USB device from device list
 /// 3. `Confirm` - User reviews selection and confirms before flashing
-/// 4. `Flashing` - Flash operation in progress (non-interactive)
-/// 5. `Result` - Flash operation completed; displays result
-/// 6. `Error` - An error occurred during operation
+/// 4. `ConfirmWipe` - User confirms overwriting existing partitions on device
+/// 5. `Flashing` - Flash operation in progress (non-interactive)
+/// 6. `Result` - Flash operation completed; displays result
+/// 7. `Error` - An error occurred during operation
 ///
-/// User can go back from `Device` → `Image` or from `Confirm` → `Device`.
+/// User can go back from `Device` -> `Image`, `Confirm` -> `Device`, or `ConfirmWipe` -> `Confirm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     /// User is selecting ISO image file from filesystem
@@ -47,6 +48,8 @@ pub enum Step {
     Device,
     /// User is reviewing selection before flashing
     Confirm,
+    /// User is confirming overwrite of existing partitions on the target device
+    ConfirmWipe,
     /// Flashing is in progress; non-interactive
     Flashing,
     /// Flash operation completed; showing result (success or failure)
@@ -101,6 +104,8 @@ pub struct FlashResult {
 /// * `flash_done` - Bytes flashed so far (updated in real-time)
 /// * `progress_rx` - Channel receiver for progress updates from flash thread
 /// * `result_rx` - Channel receiver for final result from flash thread
+/// * `partition_info` - Cached partition info for the selected device (if checked)
+/// * `user_confirmed_wipe` - Whether the user has confirmed overwriting existing partitions
 pub struct App {
     pub step: Step,
     pub image_input: String,
@@ -121,6 +126,8 @@ pub struct App {
     pub flash_done: u64,
     pub progress_rx: Option<Receiver<String>>,
     pub result_rx: Option<Receiver<Result<(), String>>>,
+    pub partition_info: Option<flash::DevicePartitionInfo>,
+    pub user_confirmed_wipe: bool,
 }
 
 impl App {
@@ -204,6 +211,8 @@ impl App {
             flash_done: 0,
             progress_rx: None,
             result_rx: None,
+            partition_info: None,
+            user_confirmed_wipe: false,
         }
     }
 
@@ -342,9 +351,12 @@ impl App {
         self.result_rx = Some(result_rx);
         self.step = Step::Flashing;
 
+        let confirmed_wipe = self.user_confirmed_wipe;
+
         std::thread::spawn(move || {
             let _ = progress_tx.send(format!("Flashing {} -> {}", image.display(), device));
-            let result = flash::flash_image_with_progress(&image, &device, progress_tx);
+            let result =
+                flash::flash_image_with_progress(&image, &device, progress_tx, confirmed_wipe);
             let result = result.map_err(|err| err.to_string());
             let _ = result_tx.send(result);
         });

@@ -40,6 +40,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<AppExit> {
         Step::Image => handle_image_step(app, key),
         Step::Device => handle_device_step(app, key),
         Step::Confirm => handle_confirm_step(app, key),
+        Step::ConfirmWipe => handle_confirm_wipe_step(app, key),
         Step::Flashing => handle_flashing_step(app, key),
         Step::Result => handle_result_step(app, key),
         Step::Error => handle_done_step(app, key),
@@ -181,13 +182,56 @@ fn handle_confirm_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
             } else if let (Some(image), Some(device)) =
                 (app.image_path(), app.selected_device.clone())
             {
+                // Check if the target device has existing partitions
+                match crate::flash::check_device_partitions(&device.device_path()) {
+                    Ok(info) if info.has_partitions => {
+                        // Device has partitions -- ask the user to confirm the wipe
+                        app.partition_info = Some(info);
+                        app.user_confirmed_wipe = false;
+                        app.step = Step::ConfirmWipe;
+                    }
+                    _ => {
+                        // No partitions or couldn't check -- proceed directly
+                        app.user_confirmed_wipe = false;
+                        if app.execute {
+                            app.start_flash(image, device.device_path());
+                        } else {
+                            app.flash_result = Some(crate::FlashResult {
+                                ok: true,
+                                message: format!(
+                                    "Dry run: would flash {} to {}",
+                                    image.display(),
+                                    device.device_path()
+                                ),
+                            });
+                            app.step = Step::Result;
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('b') => {
+            app.step = Step::Device;
+        }
+        _ => {}
+    }
+
+    None
+}
+
+fn handle_confirm_wipe_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
+    match key.code {
+        KeyCode::Char('y') => {
+            // User confirmed the wipe -- proceed with flashing
+            app.user_confirmed_wipe = true;
+            if let (Some(image), Some(device)) = (app.image_path(), app.selected_device.clone()) {
                 if app.execute {
                     app.start_flash(image, device.device_path());
                 } else {
                     app.flash_result = Some(crate::FlashResult {
                         ok: true,
                         message: format!(
-                            "Dry run: would flash {} to {}",
+                            "Dry run: would flash {} to {} (with partition wipe)",
                             image.display(),
                             device.device_path()
                         ),
@@ -196,8 +240,11 @@ fn handle_confirm_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
                 }
             }
         }
-        KeyCode::Char('b') => {
-            app.step = Step::Device;
+        KeyCode::Char('n') | KeyCode::Char('b') => {
+            // User declined -- go back to the confirm screen
+            app.partition_info = None;
+            app.user_confirmed_wipe = false;
+            app.step = Step::Confirm;
         }
         _ => {}
     }
@@ -254,6 +301,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         Step::Image => draw_image_step(frame, app, chunks[1]),
         Step::Device => draw_device_step(frame, app, chunks[1]),
         Step::Confirm => draw_confirm_step(frame, app, chunks[1]),
+        Step::ConfirmWipe => draw_confirm_wipe_step(frame, app, chunks[1]),
         Step::Flashing => draw_flashing_step(frame, app, chunks[1]),
         Step::Result => draw_result_step(frame, app, chunks[1]),
         Step::Error => draw_error_step(frame, app, chunks[1]),
@@ -385,6 +433,63 @@ fn draw_confirm_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layou
     frame.render_widget(paragraph, area);
 }
 
+fn draw_confirm_wipe_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let device = app
+        .selected_device
+        .as_ref()
+        .map(|d| d.device_path())
+        .unwrap_or_else(|| "<none>".to_string());
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "WARNING: Device has existing partitions!",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Device: {device}")),
+        Line::from(""),
+        Line::from("The following partitions were found:"),
+    ];
+
+    if let Some(info) = &app.partition_info {
+        for detail in &info.partition_details {
+            lines.push(Line::from(Span::styled(
+                format!("  {detail}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        if info.has_mounted {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Mounted at:",
+                Style::default().fg(Color::Red),
+            )));
+            for mp in &info.mounted_paths {
+                lines.push(Line::from(Span::styled(
+                    format!("  {mp}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "ALL DATA ON THIS DEVICE WILL BE DESTROYED.",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("Press 'y' to wipe and flash, 'n' to go back."));
+
+    let text = Text::from(lines);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Confirm Overwrite");
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_flashing_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let (percent, label) = if let Some(total) = app.flash_total {
         let percent = if total == 0 {
@@ -467,6 +572,7 @@ fn status_line(app: &App) -> Line<'static> {
         Step::Image => "Up/Down=select  Enter=open/select  Backspace=up  Ctrl+U=clear  q=quit",
         Step::Device => "Up/Down=select  Enter=next  r=rescan  a=all  b=back  q=quit",
         Step::Confirm => "f=flash  b=back  q=quit",
+        Step::ConfirmWipe => "y=confirm wipe  n=cancel  q=quit",
         Step::Flashing => "Flashing... please wait",
         Step::Result | Step::Error => "q=quit",
     };

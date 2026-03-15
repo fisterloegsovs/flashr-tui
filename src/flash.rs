@@ -103,6 +103,7 @@ pub fn flash_image_with_progress(
     image: &Path,
     device: &str,
     progress: mpsc::Sender<String>,
+    user_confirmed_wipe: bool,
 ) -> Result<()> {
     match crate::iso::detect(image)? {
         IsoKind::Hybrid => {}
@@ -116,7 +117,7 @@ pub fn flash_image_with_progress(
         }
     }
 
-    ensure_device_safe(device)?;
+    ensure_device_safe(device, user_confirmed_wipe)?;
 
     // Find an elevator if we're not root
     let elevator = if is_root() {
@@ -134,6 +135,8 @@ pub fn flash_image_with_progress(
         ));
         Some(elev)
     };
+
+    wipe_device_if_needed(device, elevator, &progress)?;
 
     let mut child = elevated_command("dd", elevator)
         .arg(format!("if={}", image.display()))
@@ -287,9 +290,100 @@ fn label_device_from_iso(
     }
 }
 
-fn ensure_device_safe(device: &str) -> Result<()> {
-    let meta = std::fs::metadata(device)
-        .with_context(|| format!("target device not found: {device}"))?;
+/// Information about existing partitions on a device.
+///
+/// Used to warn the user before wiping a device that already has partitions,
+/// filesystems, or a bootable operating system.
+#[derive(Debug, Clone)]
+pub struct DevicePartitionInfo {
+    /// Whether the device has any partitions
+    pub has_partitions: bool,
+    /// Human-readable list of partition details (e.g., "/dev/sdb1 ext4 50G")
+    pub partition_details: Vec<String>,
+    /// Whether any partitions are currently mounted
+    pub has_mounted: bool,
+    /// Mountpoints that are currently in use
+    pub mounted_paths: Vec<String>,
+}
+
+/// Check whether a device has existing partitions, filesystems, or mounted volumes.
+///
+/// This is used before flashing to warn the user that the target device already
+/// contains data (e.g., a bootable OS) and give them a chance to confirm or cancel.
+///
+/// # Arguments
+///
+/// * `device` - Device path (e.g., "/dev/sdb")
+///
+/// # Returns
+///
+/// `Ok(DevicePartitionInfo)` with details about what was found, or an error if
+/// `lsblk` cannot be run.
+pub fn check_device_partitions(device: &str) -> Result<DevicePartitionInfo> {
+    let output = Command::new("lsblk")
+        .args([
+            "--json",
+            "-o",
+            "NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT,MOUNTPOINTS",
+            "-p",
+            device,
+        ])
+        .output()
+        .context("run lsblk to check partitions")?;
+
+    if !output.status.success() {
+        return Ok(DevicePartitionInfo {
+            has_partitions: false,
+            partition_details: Vec::new(),
+            has_mounted: false,
+            mounted_paths: Vec::new(),
+        });
+    }
+
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("parse lsblk partition info")?;
+
+    let mut partition_details = Vec::new();
+    let mut mounted_paths = Vec::new();
+
+    for dev in &parsed.blockdevices {
+        for child in &dev.children {
+            if child.r#type == "part" {
+                let fstype = child.fstype.as_deref().unwrap_or("unknown");
+                let size = child.size.as_deref().unwrap_or("?");
+                partition_details.push(format!("{} ({}, {})", child.name, fstype, size));
+
+                // Collect mountpoints
+                if let Some(mp) = &child.mountpoint {
+                    if !mp.is_empty() && mp != "[SWAP]" {
+                        mounted_paths.push(mp.clone());
+                    }
+                }
+                if let Some(list) = &child.mountpoints {
+                    for item in list.iter().flatten() {
+                        if !item.is_empty() && item != "[SWAP]" && !mounted_paths.contains(item) {
+                            mounted_paths.push(item.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let has_partitions = !partition_details.is_empty();
+    let has_mounted = !mounted_paths.is_empty();
+
+    Ok(DevicePartitionInfo {
+        has_partitions,
+        partition_details,
+        has_mounted,
+        mounted_paths,
+    })
+}
+
+fn ensure_device_safe(device: &str, user_confirmed_wipe: bool) -> Result<()> {
+    let meta =
+        std::fs::metadata(device).with_context(|| format!("target device not found: {device}"))?;
     if !meta.file_type().is_block_device() {
         return Err(anyhow::anyhow!("target is not a block device: {device}"));
     }
@@ -298,7 +392,7 @@ fn ensure_device_safe(device: &str) -> Result<()> {
         .args([
             "--json",
             "-o",
-            "NAME,TYPE,MOUNTPOINT,MOUNTPOINTS",
+            "NAME,TYPE,MOUNTPOINT,MOUNTPOINTS,FSTYPE",
             "-p",
             device,
         ])
@@ -329,16 +423,72 @@ fn ensure_device_safe(device: &str) -> Result<()> {
         ));
     }
 
-    if !mounts.is_empty() {
-        let preview = mounts
-            .into_iter()
-            .take(4)
-            .collect::<Vec<_>>()
-            .join(", ");
+    // If the user confirmed the wipe, mounted partitions are OK -- they will
+    // be unmounted by wipe_device_if_needed(). Otherwise, block and ask the
+    // user to unmount manually.
+    if !user_confirmed_wipe && !mounts.is_empty() {
+        let preview = mounts.into_iter().take(4).collect::<Vec<_>>().join(", ");
         return Err(anyhow::anyhow!(
             "Target device has mounted filesystems ({preview}). Unmount all partitions before flashing."
         ));
     }
+
+    Ok(())
+}
+
+fn wipe_device_if_needed(
+    device: &str,
+    elevator: Option<&str>,
+    progress: &mpsc::Sender<String>,
+) -> Result<()> {
+    let output = Command::new("lsblk")
+        .args(["--json", "-o", "NAME,TYPE", "-p", device])
+        .output()
+        .context("run lsblk to check partitions")?;
+
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let parsed: LsblkOutput =
+        serde_json::from_slice(&output.stdout).context("parse lsblk partition output")?;
+
+    let has_partitions = parsed
+        .blockdevices
+        .iter()
+        .any(|dev| dev.children.iter().any(|c| c.r#type == "part"));
+
+    if !has_partitions {
+        return Ok(());
+    }
+
+    let _ = progress.send("Device has existing partitions, wiping...".to_string());
+
+    let partitions: Vec<String> = parsed
+        .blockdevices
+        .iter()
+        .flat_map(|dev| {
+            dev.children
+                .iter()
+                .filter(|c| c.r#type == "part")
+                .map(|c| format!("/dev/{}", c.name))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    for partition in &partitions {
+        let mut unmount = elevated_command("umount", elevator);
+        unmount.arg(partition);
+        let _ = unmount.status();
+    }
+
+    let mut wipefs = elevated_command("wipefs", elevator);
+    wipefs.arg("-a").arg(device);
+    wipefs.output().context("run wipefs")?;
+
+    let _ = elevated_command("partprobe", elevator).arg(device).status();
+
+    let _ = progress.send("Device wiped successfully.".to_string());
 
     Ok(())
 }
