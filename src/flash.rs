@@ -23,14 +23,16 @@ pub fn is_root() -> bool {
 
 /// Find an available privilege elevation tool.
 ///
-/// Checks for `pkexec` first (graphical prompt on desktop systems),
-/// then falls back to `sudo` (terminal prompt).
+/// Checks for `sudo` first (terminal prompt with credential caching),
+/// then falls back to `pkexec` (graphical prompt, no caching).
+/// `sudo` is preferred because its credential cache (default 15 minutes)
+/// avoids repeated password prompts across multiple commands.
 ///
 /// # Returns
 ///
-/// `Some("pkexec")` or `Some("sudo")` if found, `None` if neither is available.
+/// `Some("sudo")` or `Some("pkexec")` if found, `None` if neither is available.
 pub fn find_elevator() -> Option<&'static str> {
-    ["pkexec", "sudo"].into_iter().find(|tool| {
+    ["sudo", "pkexec"].into_iter().find(|tool| {
         Command::new("which")
             .arg(tool)
             .stdout(std::process::Stdio::null())
@@ -133,6 +135,21 @@ pub fn flash_image_with_progress(
             "Not running as root; using '{}' for privilege elevation",
             elev
         ));
+        // Prime the credential cache so the user only enters their password
+        // once. `sudo -v` validates credentials without running a command;
+        // subsequent sudo calls within the timeout window (default 15 min)
+        // won't re-prompt. For pkexec this is a no-op (no caching), but the
+        // batched shell commands below still keep prompts to a minimum.
+        if elev == "sudo" {
+            let _ = progress.send("Requesting sudo access...".to_string());
+            let prime = Command::new("sudo")
+                .arg("-v")
+                .status()
+                .context("failed to obtain sudo credentials")?;
+            if !prime.success() {
+                return Err(anyhow::anyhow!("sudo authentication failed"));
+            }
+        }
         Some(elev)
     };
 
@@ -184,10 +201,11 @@ pub fn flash_image_with_progress(
 
     Command::new("sync").status().ok();
 
-    let _ = elevated_command("partprobe", elevator).arg(device).status();
-
-    if let Ok(Some(message)) = label_device_from_iso(image, device, elevator) {
-        let _ = progress.send(message);
+    // Batch post-flash privileged operations (partprobe + label) into one
+    // elevated shell invocation so only a single privilege prompt is needed.
+    let label_result = label_device_post_flash(image, device, elevator);
+    if let Ok(Some(message)) = &label_result {
+        let _ = progress.send(message.clone());
     }
 
     Ok(())
@@ -221,73 +239,125 @@ pub fn parse_dd_bytes(line: &str) -> Option<u64> {
     }
 }
 
-/// Label the USB device based on the ISO filename.
+/// Perform post-flash privileged operations in a single elevated shell call.
 ///
-/// Extracts the ISO filename (without extension), sanitizes it for use as a partition label,
-/// queries the device's filesystems with `lsblk`, and uses the appropriate labeling tool
-/// (fatlabel, ntfslabel, or e2label) to set the label on the first writable partition.
-///
-/// # Arguments
-///
-/// * `image` - Path to the ISO file
-/// * `device` - Device path (e.g., "/dev/sdb")
-/// * `elevator` - Optional privilege elevation tool (e.g., "pkexec", "sudo")
-///
-/// # Returns
-///
-/// `Ok(Some(message))` with a success or error message, or `Ok(None)` if no suitable partition found.
-/// Errors are non-fatal and reported as messages.
-fn label_device_from_iso(
+/// Runs `partprobe` to refresh the kernel partition table, then attempts to
+/// label the USB partition based on the ISO filename. Both operations are
+/// batched into one `sh -c` invocation so the user only sees one privilege
+/// prompt instead of two.
+fn label_device_post_flash(
     image: &Path,
     device: &str,
     elevator: Option<&str>,
 ) -> Result<Option<String>> {
-    let Some(label_base) = image.file_stem().and_then(|s| s.to_str()) else {
-        return Ok(None);
+    let label_base = image
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| sanitize_label(s))
+        .unwrap_or_default();
+
+    // Always run partprobe; optionally append the label command.
+    let mut script = format!("partprobe '{}'", device);
+
+    // We need lsblk output to find the first labelable partition, but lsblk
+    // may not see new partitions until partprobe finishes.  Incorporate a
+    // small sleep and a second lsblk *inside* the elevated script so
+    // everything stays in one privilege context.  However, building the
+    // label command requires parsing lsblk JSON in Rust, which we cannot do
+    // inside the shell script.  Instead we run partprobe first inside the
+    // script, then do the lsblk + label logic afterwards.
+    //
+    // Strategy: run "partprobe; sleep 0.5" in the elevated script, then do
+    // an unprivileged lsblk to discover the partition, and finally run the
+    // label tool in the same elevated call.  Because we cannot do all of
+    // that in *one* invocation without a temp script file, we split into:
+    //   1. Elevated: partprobe (+ label if we can determine it beforehand)
+    //   2. If label unknown: unprivileged lsblk, then elevated label tool
+    //
+    // Since the device was just flashed, we can try lsblk now (the kernel
+    // may already know the partitions from dd's sync).  If it works, great
+    // -- we batch everything into one call.  If not, we do a second call.
+
+    let label_info = resolve_label_command(image, device);
+
+    let label_message = if let Some((label, tool, args)) = &label_info {
+        // We know the label command; append it to the script.
+        let args_str: Vec<String> = args.iter().map(|a| format!("'{}'", a)).collect();
+        script.push_str(&format!(" && {} {}", tool, args_str.join(" ")));
+        Some(format!("Label set to {label}"))
+    } else {
+        None
     };
 
-    let label_base = sanitize_label(label_base);
+    let status = elevated_command("sh", elevator)
+        .args(["-c", &script])
+        .status()
+        .context("run post-flash script (partprobe + label)")?;
+
+    if !status.success() && label_info.is_some() {
+        // partprobe succeeded but label may have failed; not fatal.
+        return Ok(Some("Labeling failed".to_string()));
+    }
+
+    // If we couldn't determine the label command earlier (lsblk didn't
+    // show partitions yet), retry now that partprobe has run.
+    if label_info.is_none() && !label_base.is_empty() {
+        if let Some((label, tool, args)) = resolve_label_command(image, device) {
+            let args_str: Vec<String> = args.iter().map(|a| format!("'{}'", a)).collect();
+            let label_script = format!("{} {}", tool, args_str.join(" "));
+            let label_status = elevated_command("sh", elevator)
+                .args(["-c", &label_script])
+                .status();
+            return match label_status {
+                Ok(s) if s.success() => Ok(Some(format!("Label set to {label}"))),
+                Ok(_) => Ok(Some("Labeling failed".to_string())),
+                Err(_) => Ok(Some("Labeling tool not available".to_string())),
+            };
+        }
+    }
+
+    Ok(label_message)
+}
+
+/// Resolve the label tool, args, and label string for a device partition.
+///
+/// Runs an unprivileged `lsblk` to discover the first partition with a
+/// supported filesystem and returns the label command to apply.
+fn resolve_label_command(image: &Path, device: &str) -> Option<(String, String, Vec<String>)> {
+    let label_base = image
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| sanitize_label(s))?;
+
     if label_base.is_empty() {
-        return Ok(None);
+        return None;
     }
 
     let output = Command::new("lsblk")
         .args(["--json", "-o", "NAME,FSTYPE,TYPE", "-p", device])
         .output()
-        .context("run lsblk for fstype")?;
+        .ok()?;
 
     if !output.status.success() {
-        return Err(anyhow::anyhow!("lsblk failed for fstype"));
+        return None;
     }
 
-    let parsed: LsblkOutput =
-        serde_json::from_slice(&output.stdout).context("parse lsblk fstype output")?;
+    let parsed: LsblkOutput = serde_json::from_slice(&output.stdout).ok()?;
 
-    let mut target: Option<(String, String)> = None;
     for dev in parsed.blockdevices {
         if dev.r#type == "disk" {
             for child in dev.children {
                 if let Some(fstype) = child.fstype.clone() {
                     if is_supported_fstype(&fstype) {
-                        target = Some((child.name, fstype));
-                        break;
+                        let (label, tool, args) = label_command(&child.name, &fstype, &label_base);
+                        return Some((label, tool.to_string(), args));
                     }
                 }
             }
         }
     }
 
-    let Some((partition, fstype)) = target else {
-        return Ok(None);
-    };
-
-    let (label, tool, extra_args) = label_command(&partition, &fstype, &label_base);
-    let status = elevated_command(tool, elevator).args(extra_args).status();
-    match status {
-        Ok(status) if status.success() => Ok(Some(format!("Label set to {label}"))),
-        Ok(_) => Ok(Some("Labeling failed".to_string())),
-        Err(_) => Ok(Some("Labeling tool not available".to_string())),
-    }
+    None
 }
 
 /// Information about existing partitions on a device.
@@ -476,17 +546,19 @@ fn wipe_device_if_needed(
         })
         .collect();
 
+    // Build a single shell script for all wipe operations (unmount + wipefs +
+    // partprobe) so only one privilege prompt is needed instead of one per
+    // partition plus two more for wipefs and partprobe.
+    let mut script = String::new();
     for partition in &partitions {
-        let mut unmount = elevated_command("umount", elevator);
-        unmount.arg(partition);
-        let _ = unmount.status();
+        script.push_str(&format!("umount '{}' 2>/dev/null || true; ", partition));
     }
+    script.push_str(&format!("wipefs -a '{}' && partprobe '{}'", device, device));
 
-    let mut wipefs = elevated_command("wipefs", elevator);
-    wipefs.arg("-a").arg(device);
-    wipefs.output().context("run wipefs")?;
-
-    let _ = elevated_command("partprobe", elevator).arg(device).status();
+    elevated_command("sh", elevator)
+        .args(["-c", &script])
+        .status()
+        .context("run wipe script (umount + wipefs + partprobe)")?;
 
     let _ = progress.send("Device wiped successfully.".to_string());
 

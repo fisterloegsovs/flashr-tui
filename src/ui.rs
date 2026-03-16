@@ -50,22 +50,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<AppExit> {
 fn handle_image_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
     match key.code {
         KeyCode::Enter => {
-            if !app.image_input.trim().is_empty() {
-                if app.validate_image() {
-                    app.refresh_iso_kind();
-                    app.step = Step::Device;
-                }
-            } else if let Some(entry) = app.entries.get(app.entry_selected).cloned() {
+            if let Some(entry) = app.entries.get(app.entry_selected).cloned() {
                 if entry.is_dir {
                     app.cwd = entry.path;
                     app.entries = crate::load_entries(&app.cwd);
                     app.entry_selected = 0;
+                    app.image_input.clear();
+                    app.status.clear();
                 } else {
                     app.image_input = entry.path.display().to_string();
                     if app.validate_image() {
                         app.refresh_iso_kind();
                         app.step = Step::Device;
                     }
+                }
+            } else if !app.image_input.trim().is_empty() {
+                if app.validate_image() {
+                    app.refresh_iso_kind();
+                    app.step = Step::Device;
                 }
             }
         }
