@@ -34,10 +34,11 @@ pub struct FileEntry {
 /// 1. `Image` - User selects an ISO file via file picker
 /// 2. `Device` - User selects a target USB device from device list
 /// 3. `Confirm` - User reviews selection and confirms before flashing
-/// 4. `ConfirmWipe` - User confirms overwriting existing partitions on device
-/// 5. `Flashing` - Flash operation in progress (non-interactive)
-/// 6. `Result` - Flash operation completed; displays result
-/// 7. `Error` - An error occurred during operation
+/// 4. `ConvertIso` - User confirms in-place isohybrid conversion (if non-hybrid)
+/// 5. `ConfirmWipe` - User confirms overwriting existing partitions on device
+/// 6. `Flashing` - Flash operation in progress (non-interactive)
+/// 7. `Result` - Flash operation completed; displays result
+/// 8. `Error` - An error occurred during operation
 ///
 /// User can go back from `Device` -> `Image`, `Confirm` -> `Device`, or `ConfirmWipe` -> `Confirm`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,8 @@ pub enum Step {
     Device,
     /// User is reviewing selection before flashing
     Confirm,
+    /// User is confirming in-place isohybrid conversion of a non-hybrid ISO
+    ConvertIso,
     /// User is confirming overwrite of existing partitions on the target device
     ConfirmWipe,
     /// Flashing is in progress; non-interactive
@@ -128,6 +131,10 @@ pub struct App {
     pub result_rx: Option<Receiver<Result<(), String>>>,
     pub partition_info: Option<flash::DevicePartitionInfo>,
     pub user_confirmed_wipe: bool,
+    /// When true, file picker only shows .iso/.img/.raw files (directories always shown).
+    pub filter_iso_only: bool,
+    /// When true, show hidden files (starting with '.') in the file picker.
+    pub show_hidden: bool,
 }
 
 impl App {
@@ -172,7 +179,9 @@ impl App {
         let image_valid = image.as_ref().map(|p| p.is_file()).unwrap_or(false);
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let entries = load_entries(&cwd);
+        let filter_iso_only = true;
+        let show_hidden = false;
+        let entries = load_entries(&cwd, filter_iso_only, show_hidden);
 
         let step = if image_valid {
             Step::Device
@@ -213,7 +222,34 @@ impl App {
             result_rx: None,
             partition_info: None,
             user_confirmed_wipe: false,
+            filter_iso_only,
+            show_hidden,
         }
+    }
+
+    /// Reload the file picker entries using current filter settings.
+    pub fn reload_entries(&mut self) {
+        self.entries = load_entries(&self.cwd, self.filter_iso_only, self.show_hidden);
+        if self.entry_selected >= self.entries.len() {
+            self.entry_selected = 0;
+        }
+    }
+
+    /// Reset flash-related state so the user can start over from the Image step.
+    pub fn reset_to_start(&mut self) {
+        self.step = Step::Image;
+        self.flash_progress.clear();
+        self.flash_result = None;
+        self.flash_total = None;
+        self.flash_done = 0;
+        self.progress_rx = None;
+        self.result_rx = None;
+        self.partition_info = None;
+        self.user_confirmed_wipe = false;
+        self.status.clear();
+        self.iso_kind = IsoKind::Unknown;
+        self.iso_info.clear();
+        self.reload_entries();
     }
 
     /// Get the image file path from user input string.
@@ -363,21 +399,25 @@ impl App {
     }
 }
 
+/// File extensions shown when the ISO filter is active.
+const ISO_EXTENSIONS: &[&str] = &["iso", "img", "raw"];
+
 /// Load directory contents for the file picker.
 ///
-/// Reads all entries in a directory, filters out hidden files (starting with '.'),
-/// and sorts them with directories first, then by name.
+/// Reads all entries in a directory and applies optional filters.
 /// Always includes a ".." entry for navigating to parent directory (unless already at root).
 ///
 /// # Arguments
 ///
 /// * `cwd` - Current working directory path to list
+/// * `filter_iso` - When true, only show files with ISO-related extensions
+/// * `show_hidden` - When true, include files starting with '.'
 ///
 /// # Returns
 ///
 /// Vector of `FileEntry` structs sorted by directory-first, then alphabetically.
 /// If directory cannot be read, returns an empty vector.
-pub fn load_entries(cwd: &std::path::Path) -> Vec<FileEntry> {
+pub fn load_entries(cwd: &std::path::Path, filter_iso: bool, show_hidden: bool) -> Vec<FileEntry> {
     let mut entries: Vec<FileEntry> = std::fs::read_dir(cwd)
         .ok()
         .into_iter()
@@ -385,10 +425,16 @@ pub fn load_entries(cwd: &std::path::Path) -> Vec<FileEntry> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if !show_hidden && name.starts_with('.') {
                 return None;
             }
             let is_dir = path.is_dir();
+            if filter_iso && !is_dir {
+                let lower = name.to_lowercase();
+                if !ISO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) {
+                    return None;
+                }
+            }
             Some(FileEntry { name, path, is_dir })
         })
         .collect();

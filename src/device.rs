@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::os::unix::fs::FileTypeExt;
 use std::process::Command;
 
 /// Represents a block storage device (USB drive, hard disk, etc.).
@@ -106,4 +107,52 @@ pub fn list(show_all: bool) -> Result<Vec<Disk>> {
         .collect();
 
     Ok(disks)
+}
+
+/// A validated device path guaranteed to be a real block device (not a symlink).
+///
+/// Construct via `DevicePath::validate()` which checks that the path exists,
+/// is not a symlink, and points to a block device.
+#[derive(Debug, Clone)]
+pub struct DevicePath(String);
+
+impl DevicePath {
+    /// Validate a device path string.
+    ///
+    /// Rejects symlinks (tells the user the real target) and non-block-device paths.
+    pub fn validate(path: &str) -> Result<Self> {
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("target device not found: {path}"))?;
+        if meta.file_type().is_symlink() {
+            let real = std::fs::canonicalize(path)
+                .with_context(|| format!("failed to resolve symlink: {path}"))?;
+            return Err(anyhow::anyhow!(
+                "target path {path} is a symlink to {}. Use the real device path instead.",
+                real.display()
+            ));
+        }
+        let meta =
+            std::fs::metadata(path).with_context(|| format!("target device not found: {path}"))?;
+        if !meta.file_type().is_block_device() {
+            return Err(anyhow::anyhow!("target is not a block device: {path}"));
+        }
+        Ok(Self(path.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DevicePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for DevicePath {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
 }

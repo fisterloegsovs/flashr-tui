@@ -40,6 +40,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<AppExit> {
         Step::Image => handle_image_step(app, key),
         Step::Device => handle_device_step(app, key),
         Step::Confirm => handle_confirm_step(app, key),
+        Step::ConvertIso => handle_convert_iso_step(app, key),
         Step::ConfirmWipe => handle_confirm_wipe_step(app, key),
         Step::Flashing => handle_flashing_step(app, key),
         Step::Result => handle_result_step(app, key),
@@ -47,14 +48,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<AppExit> {
     }
 }
 
+/// Number of entries to skip for PageUp/PageDown.
+const PAGE_SIZE: usize = 15;
+
 fn handle_image_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
     match key.code {
         KeyCode::Enter => {
             if let Some(entry) = app.entries.get(app.entry_selected).cloned() {
                 if entry.is_dir {
                     app.cwd = entry.path;
-                    app.entries = crate::load_entries(&app.cwd);
-                    app.entry_selected = 0;
+                    app.reload_entries();
                     app.image_input.clear();
                     app.status.clear();
                 } else {
@@ -64,11 +67,9 @@ fn handle_image_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
                         app.step = Step::Device;
                     }
                 }
-            } else if !app.image_input.trim().is_empty() {
-                if app.validate_image() {
-                    app.refresh_iso_kind();
-                    app.step = Step::Device;
-                }
+            } else if !app.image_input.trim().is_empty() && app.validate_image() {
+                app.refresh_iso_kind();
+                app.step = Step::Device;
             }
         }
         KeyCode::Backspace => {
@@ -76,8 +77,7 @@ fn handle_image_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
                 app.image_input.pop();
             } else if let Some(parent) = app.cwd.parent() {
                 app.cwd = parent.to_path_buf();
-                app.entries = crate::load_entries(&app.cwd);
-                app.entry_selected = 0;
+                app.reload_entries();
             }
         }
         KeyCode::Up => {
@@ -89,6 +89,41 @@ fn handle_image_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
             if app.entry_selected + 1 < app.entries.len() {
                 app.entry_selected += 1;
             }
+        }
+        KeyCode::PageUp => {
+            app.entry_selected = app.entry_selected.saturating_sub(PAGE_SIZE);
+        }
+        KeyCode::PageDown => {
+            if !app.entries.is_empty() {
+                app.entry_selected =
+                    (app.entry_selected + PAGE_SIZE).min(app.entries.len() - 1);
+            }
+        }
+        KeyCode::Home => {
+            app.entry_selected = 0;
+        }
+        KeyCode::End => {
+            if !app.entries.is_empty() {
+                app.entry_selected = app.entries.len() - 1;
+            }
+        }
+        KeyCode::Tab => {
+            app.filter_iso_only = !app.filter_iso_only;
+            app.reload_entries();
+            app.status = if app.filter_iso_only {
+                "Filter: ISO/IMG/RAW only".to_string()
+            } else {
+                "Filter: showing all files".to_string()
+            };
+        }
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.show_hidden = !app.show_hidden;
+            app.reload_entries();
+            app.status = if app.show_hidden {
+                "Showing hidden files".to_string()
+            } else {
+                "Hidden files hidden".to_string()
+            };
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.image_input.clear();
@@ -179,11 +214,24 @@ fn handle_confirm_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
     match key.code {
         KeyCode::Char('f') => {
             if app.iso_kind == crate::iso::IsoKind::NonHybrid {
-                app.status = "ISO has no partition table; hybrid ISO required.".to_string();
-                app.step = Step::Error;
+                if crate::flash::has_isohybrid() {
+                    app.step = Step::ConvertIso;
+                } else {
+                    app.status =
+                        "ISO has no partition table; hybrid ISO required. Install syslinux for isohybrid conversion."
+                            .to_string();
+                    app.step = Step::Error;
+                }
             } else if let (Some(image), Some(device)) =
                 (app.image_path(), app.selected_device.clone())
             {
+                // Re-verify the device still exists before proceeding.
+                if let Err(e) = crate::device::DevicePath::validate(&device.device_path()) {
+                    app.status = format!("Device error: {e}");
+                    app.step = Step::Error;
+                    return None;
+                }
+
                 // Check if the target device has existing partitions
                 match crate::flash::check_device_partitions(&device.device_path()) {
                     Ok(info) if info.has_partitions => {
@@ -214,6 +262,38 @@ fn handle_confirm_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
         }
         KeyCode::Char('b') => {
             app.step = Step::Device;
+        }
+        _ => {}
+    }
+
+    None
+}
+
+fn handle_convert_iso_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
+    match key.code {
+        KeyCode::Char('y') => {
+            if let Some(image) = app.image_path() {
+                match crate::flash::convert_isohybrid(&image) {
+                    Ok(()) => {
+                        app.refresh_iso_kind();
+                        if app.iso_kind == crate::iso::IsoKind::Hybrid {
+                            app.status = "ISO converted to hybrid format.".to_string();
+                            app.step = Step::Confirm;
+                        } else {
+                            app.status =
+                                "Conversion ran but ISO is still not hybrid.".to_string();
+                            app.step = Step::Error;
+                        }
+                    }
+                    Err(e) => {
+                        app.status = format!("isohybrid failed: {e}");
+                        app.step = Step::Error;
+                    }
+                }
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('b') => {
+            app.step = Step::Confirm;
         }
         _ => {}
     }
@@ -258,11 +338,17 @@ fn handle_flashing_step(_app: &mut App, _key: KeyEvent) -> Option<AppExit> {
     None
 }
 
-fn handle_result_step(_app: &mut App, _key: KeyEvent) -> Option<AppExit> {
+fn handle_result_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
+    if key.code == KeyCode::Char('r') {
+        app.reset_to_start();
+    }
     None
 }
 
-fn handle_done_step(_app: &mut App, _key: KeyEvent) -> Option<AppExit> {
+fn handle_done_step(app: &mut App, key: KeyEvent) -> Option<AppExit> {
+    if key.code == KeyCode::Char('r') {
+        app.reset_to_start();
+    }
     None
 }
 
@@ -303,6 +389,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &App) {
         Step::Image => draw_image_step(frame, app, chunks[1]),
         Step::Device => draw_device_step(frame, app, chunks[1]),
         Step::Confirm => draw_confirm_step(frame, app, chunks[1]),
+        Step::ConvertIso => draw_convert_iso_step(frame, app, chunks[1]),
         Step::ConfirmWipe => draw_confirm_wipe_step(frame, app, chunks[1]),
         Step::Flashing => draw_flashing_step(frame, app, chunks[1]),
         Step::Result => draw_result_step(frame, app, chunks[1]),
@@ -321,8 +408,17 @@ fn draw_image_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
         .constraints([Constraint::Length(4), Constraint::Min(5)])
         .split(area);
 
+    let filter_label = if app.filter_iso_only {
+        "ISO/IMG/RAW"
+    } else {
+        "all files"
+    };
+    let hidden_label = if app.show_hidden { " +hidden" } else { "" };
+
     let header = Text::from(vec![
-        Line::from("Step 1: Choose image file"),
+        Line::from(format!(
+            "Step 1: Choose image file  [filter: {filter_label}{hidden_label}]"
+        )),
         Line::from(format!("Current dir: {}", app.cwd.display())),
         Line::from(Span::styled(
             format!("Input: {}", app.image_input),
@@ -435,6 +531,35 @@ fn draw_confirm_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layou
     frame.render_widget(paragraph, area);
 }
 
+fn draw_convert_iso_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let image = app.image_input.trim();
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "Non-hybrid ISO detected",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!("Image: {image}")),
+        Line::from(""),
+        Line::from("This ISO doesn't have a partition table and can't be"),
+        Line::from("raw-written to USB. The isohybrid tool can add one."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "WARNING: This modifies the ISO file in-place.",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Press 'y' to convert, 'n' to go back."),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Convert ISO");
+    let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_confirm_wipe_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
     let device = app
         .selected_device
@@ -497,7 +622,7 @@ fn draw_flashing_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layo
         let percent = if total == 0 {
             0
         } else {
-            ((app.flash_done.saturating_mul(100)) / total) as u16
+            (((app.flash_done.saturating_mul(100)) / total) as u16).min(100)
         };
         let label = format!("{} / {} bytes", app.flash_done, total);
         (percent, label)
@@ -548,7 +673,7 @@ fn draw_result_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout
     let text = Text::from(vec![
         Line::from(Span::styled(title, style.add_modifier(Modifier::BOLD))),
         Line::from(message),
-        Line::from("Press 'q' to quit."),
+        Line::from("Press 'r' to start over, 'q' to quit."),
     ]);
     let block = Block::default().borders(Borders::ALL).title("Result");
     let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
@@ -562,7 +687,7 @@ fn draw_error_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )),
         Line::from(app.status.as_str()),
-        Line::from("Press 'q' to quit."),
+        Line::from("Press 'r' to start over, 'q' to quit."),
     ]);
     let block = Block::default().borders(Borders::ALL).title("Error");
     let paragraph = Paragraph::new(text).block(block);
@@ -571,12 +696,13 @@ fn draw_error_step(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout:
 
 fn status_line(app: &App) -> Line<'static> {
     let keys = match app.step {
-        Step::Image => "Up/Down=select  Enter=open/select  Backspace=up  Ctrl+U=clear  q=quit",
+        Step::Image => "Up/Down/PgUp/PgDn=nav  Enter=open/select  Tab=filter  Ctrl+H=hidden  Ctrl+U=clear  q=quit",
         Step::Device => "Up/Down=select  Enter=next  r=rescan  a=all  b=back  q=quit",
         Step::Confirm => "f=flash  b=back  q=quit",
+        Step::ConvertIso => "y=convert  n=cancel  q=quit",
         Step::ConfirmWipe => "y=confirm wipe  n=cancel  q=quit",
         Step::Flashing => "Flashing... please wait",
-        Step::Result | Step::Error => "q=quit",
+        Step::Result | Step::Error => "r=restart  q=quit",
     };
 
     let mut spans = vec![Span::raw(keys)];

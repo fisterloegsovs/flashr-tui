@@ -7,18 +7,18 @@
 //! are automatically wrapped with `pkexec` or `sudo` for privilege elevation.
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 
-use crate::device::LsblkOutput;
+use crate::device::{DevicePath, LsblkOutput};
 use crate::iso::IsoKind;
 
 /// Check if the current process is running as root (euid == 0).
 pub fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    nix::unistd::geteuid().is_root()
 }
 
 /// Find an available privilege elevation tool.
@@ -32,15 +32,29 @@ pub fn is_root() -> bool {
 ///
 /// `Some("sudo")` or `Some("pkexec")` if found, `None` if neither is available.
 pub fn find_elevator() -> Option<&'static str> {
-    ["sudo", "pkexec"].into_iter().find(|tool| {
-        Command::new("which")
-            .arg(tool)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    ["sudo", "pkexec"]
+        .into_iter()
+        .find(|tool| which::which(tool).is_ok())
+}
+
+/// Check if the `isohybrid` tool (from syslinux) is available.
+pub fn has_isohybrid() -> bool {
+    which::which("isohybrid").is_ok()
+}
+
+/// Convert an ISO to hybrid format using the `isohybrid` tool.
+///
+/// This modifies the ISO file in-place by adding an MBR partition table,
+/// making it suitable for raw-writing to USB drives.
+pub fn convert_isohybrid(image: &Path) -> Result<()> {
+    let status = Command::new("isohybrid")
+        .arg(image)
+        .status()
+        .context("run isohybrid")?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("isohybrid conversion failed"));
+    }
+    Ok(())
 }
 
 /// Build a `Command` that runs a program with privilege elevation if needed.
@@ -119,7 +133,10 @@ pub fn flash_image_with_progress(
         }
     }
 
-    ensure_device_safe(device, user_confirmed_wipe)?;
+    // Validate device path (symlink, block device) via DevicePath, then
+    // check mount safety separately.
+    let device_path = DevicePath::validate(device)?;
+    ensure_device_safe(device_path.as_str(), user_confirmed_wipe)?;
 
     // Find an elevator if we're not root
     let elevator = if is_root() {
@@ -138,8 +155,7 @@ pub fn flash_image_with_progress(
         // Prime the credential cache so the user only enters their password
         // once. `sudo -v` validates credentials without running a command;
         // subsequent sudo calls within the timeout window (default 15 min)
-        // won't re-prompt. For pkexec this is a no-op (no caching), but the
-        // batched shell commands below still keep prompts to a minimum.
+        // won't re-prompt.
         if elev == "sudo" {
             let _ = progress.send("Requesting sudo access...".to_string());
             let prime = Command::new("sudo")
@@ -153,11 +169,12 @@ pub fn flash_image_with_progress(
         Some(elev)
     };
 
-    wipe_device_if_needed(device, elevator, &progress)?;
+    let dev = device_path.as_str();
+    wipe_device_if_needed(dev, elevator, &progress)?;
 
     let mut child = elevated_command("dd", elevator)
         .arg(format!("if={}", image.display()))
-        .arg(format!("of={}", device))
+        .arg(format!("of={}", dev))
         .arg("bs=4M")
         .arg("status=progress")
         .arg("oflag=sync")
@@ -201,9 +218,24 @@ pub fn flash_image_with_progress(
 
     Command::new("sync").status().ok();
 
-    // Batch post-flash privileged operations (partprobe + label) into one
-    // elevated shell invocation so only a single privilege prompt is needed.
-    let label_result = label_device_post_flash(image, device, elevator);
+    // Verify flash integrity before labeling (labeling modifies the device).
+    let _ = progress.send("Verifying flash integrity...".to_string());
+    match verify_flash(image, dev, elevator, &progress) {
+        Ok(true) => {
+            let _ = progress.send("Verification passed: SHA-256 checksums match.".to_string());
+        }
+        Ok(false) => {
+            return Err(anyhow::anyhow!(
+                "Verification failed: device content does not match source image"
+            ));
+        }
+        Err(e) => {
+            let _ = progress.send(format!("Verification skipped: {e}"));
+        }
+    }
+
+    // Post-flash privileged operations (partprobe + label).
+    let label_result = label_device_post_flash(image, dev, elevator);
     if let Ok(Some(message)) = &label_result {
         let _ = progress.send(message.clone());
     }
@@ -239,12 +271,11 @@ pub fn parse_dd_bytes(line: &str) -> Option<u64> {
     }
 }
 
-/// Perform post-flash privileged operations in a single elevated shell call.
+/// Perform post-flash privileged operations using direct command invocations.
 ///
 /// Runs `partprobe` to refresh the kernel partition table, then attempts to
-/// label the USB partition based on the ISO filename. Both operations are
-/// batched into one `sh -c` invocation so the user only sees one privilege
-/// prompt instead of two.
+/// label the USB partition based on the ISO filename. Each tool is invoked
+/// directly via `Command` (no shell interpretation) to avoid injection risks.
 fn label_device_post_flash(
     image: &Path,
     device: &str,
@@ -253,62 +284,34 @@ fn label_device_post_flash(
     let label_base = image
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| sanitize_label(s))
+        .map(sanitize_label)
         .unwrap_or_default();
 
-    // Always run partprobe; optionally append the label command.
-    let mut script = format!("partprobe '{}'", device);
-
-    // We need lsblk output to find the first labelable partition, but lsblk
-    // may not see new partitions until partprobe finishes.  Incorporate a
-    // small sleep and a second lsblk *inside* the elevated script so
-    // everything stays in one privilege context.  However, building the
-    // label command requires parsing lsblk JSON in Rust, which we cannot do
-    // inside the shell script.  Instead we run partprobe first inside the
-    // script, then do the lsblk + label logic afterwards.
-    //
-    // Strategy: run "partprobe; sleep 0.5" in the elevated script, then do
-    // an unprivileged lsblk to discover the partition, and finally run the
-    // label tool in the same elevated call.  Because we cannot do all of
-    // that in *one* invocation without a temp script file, we split into:
-    //   1. Elevated: partprobe (+ label if we can determine it beforehand)
-    //   2. If label unknown: unprivileged lsblk, then elevated label tool
-    //
-    // Since the device was just flashed, we can try lsblk now (the kernel
-    // may already know the partitions from dd's sync).  If it works, great
-    // -- we batch everything into one call.  If not, we do a second call.
-
-    let label_info = resolve_label_command(image, device);
-
-    let label_message = if let Some((label, tool, args)) = &label_info {
-        // We know the label command; append it to the script.
-        let args_str: Vec<String> = args.iter().map(|a| format!("'{}'", a)).collect();
-        script.push_str(&format!(" && {} {}", tool, args_str.join(" ")));
-        Some(format!("Label set to {label}"))
-    } else {
-        None
-    };
-
-    let status = elevated_command("sh", elevator)
-        .args(["-c", &script])
+    // Run partprobe directly (no shell).
+    let _ = elevated_command("partprobe", elevator)
+        .arg(device)
         .status()
-        .context("run post-flash script (partprobe + label)")?;
+        .context("run partprobe")?;
 
-    if !status.success() && label_info.is_some() {
-        // partprobe succeeded but label may have failed; not fatal.
-        return Ok(Some("Labeling failed".to_string()));
+    // Try to discover partitions and apply a label.
+    if let Some((label, tool, args)) = resolve_label_command(image, device) {
+        let status = elevated_command(&tool, elevator)
+            .args(&args)
+            .status();
+        return match status {
+            Ok(s) if s.success() => Ok(Some(format!("Label set to {label}"))),
+            Ok(_) => Ok(Some("Labeling failed".to_string())),
+            Err(_) => Ok(Some("Labeling tool not available".to_string())),
+        };
     }
 
-    // If we couldn't determine the label command earlier (lsblk didn't
-    // show partitions yet), retry now that partprobe has run.
-    if label_info.is_none() && !label_base.is_empty() {
+    // If lsblk didn't show partitions yet, retry now that partprobe has run.
+    if !label_base.is_empty() {
         if let Some((label, tool, args)) = resolve_label_command(image, device) {
-            let args_str: Vec<String> = args.iter().map(|a| format!("'{}'", a)).collect();
-            let label_script = format!("{} {}", tool, args_str.join(" "));
-            let label_status = elevated_command("sh", elevator)
-                .args(["-c", &label_script])
+            let status = elevated_command(&tool, elevator)
+                .args(&args)
                 .status();
-            return match label_status {
+            return match status {
                 Ok(s) if s.success() => Ok(Some(format!("Label set to {label}"))),
                 Ok(_) => Ok(Some("Labeling failed".to_string())),
                 Err(_) => Ok(Some("Labeling tool not available".to_string())),
@@ -316,7 +319,7 @@ fn label_device_post_flash(
         }
     }
 
-    Ok(label_message)
+    Ok(None)
 }
 
 /// Resolve the label tool, args, and label string for a device partition.
@@ -327,7 +330,7 @@ fn resolve_label_command(image: &Path, device: &str) -> Option<(String, String, 
     let label_base = image
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(|s| sanitize_label(s))?;
+        .map(sanitize_label)?;
 
     if label_base.is_empty() {
         return None;
@@ -451,13 +454,9 @@ pub fn check_device_partitions(device: &str) -> Result<DevicePartitionInfo> {
     })
 }
 
+/// Check mount safety for a device whose path has already been validated
+/// by `DevicePath::validate()` (symlink + block device checks).
 fn ensure_device_safe(device: &str, user_confirmed_wipe: bool) -> Result<()> {
-    let meta =
-        std::fs::metadata(device).with_context(|| format!("target device not found: {device}"))?;
-    if !meta.file_type().is_block_device() {
-        return Err(anyhow::anyhow!("target is not a block device: {device}"));
-    }
-
     let output = Command::new("lsblk")
         .args([
             "--json",
@@ -546,23 +545,96 @@ fn wipe_device_if_needed(
         })
         .collect();
 
-    // Build a single shell script for all wipe operations (unmount + wipefs +
-    // partprobe) so only one privilege prompt is needed instead of one per
-    // partition plus two more for wipefs and partprobe.
-    let mut script = String::new();
+    // Unmount each partition directly (failures are OK — partition may not be
+    // mounted). Then wipefs and partprobe, each as a direct command invocation
+    // with no shell interpretation.
     for partition in &partitions {
-        script.push_str(&format!("umount '{}' 2>/dev/null || true; ", partition));
+        let _ = elevated_command("umount", elevator)
+            .arg(partition)
+            .stderr(std::process::Stdio::null())
+            .status();
     }
-    script.push_str(&format!("wipefs -a '{}' && partprobe '{}'", device, device));
 
-    elevated_command("sh", elevator)
-        .args(["-c", &script])
+    elevated_command("wipefs", elevator)
+        .args(["-a", device])
         .status()
-        .context("run wipe script (umount + wipefs + partprobe)")?;
+        .context("wipefs failed")?;
+
+    elevated_command("partprobe", elevator)
+        .arg(device)
+        .status()
+        .context("partprobe failed after wipe")?;
 
     let _ = progress.send("Device wiped successfully.".to_string());
 
     Ok(())
+}
+
+/// Verify flash integrity by comparing SHA-256 hashes of the source image
+/// and the bytes written to the device.
+fn verify_flash(
+    image: &Path,
+    device: &str,
+    elevator: Option<&str>,
+    progress: &mpsc::Sender<String>,
+) -> Result<bool> {
+    let iso_size = std::fs::metadata(image)
+        .with_context(|| format!("read image size: {}", image.display()))?
+        .len();
+
+    let _ = progress.send("Verifying: hashing source image...".to_string());
+
+    // Hash the source ISO file.
+    let mut hasher = Sha256::new();
+    let mut file =
+        std::fs::File::open(image).with_context(|| format!("open ISO: {}", image.display()))?;
+    let mut buf = [0u8; 1024 * 1024]; // 1 MB chunks
+    let mut remaining = iso_size;
+    while remaining > 0 {
+        let to_read = std::cmp::min(remaining as usize, buf.len());
+        let n = file.read(&mut buf[..to_read]).context("read ISO for hash")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    let source_hash = hasher.finalize();
+
+    let _ = progress.send("Verifying: reading back from device...".to_string());
+
+    // Read the same number of bytes back from the device and hash them.
+    let blocks = iso_size.div_ceil(1024 * 1024);
+    let mut child = elevated_command("dd", elevator)
+        .arg(format!("if={}", device))
+        .arg("bs=1M")
+        .arg(format!("count={}", blocks))
+        .arg("status=none")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn dd for verification read")?;
+
+    let mut hasher = Sha256::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let mut remaining = iso_size;
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining as usize, buf.len());
+            let n = stdout
+                .read(&mut buf[..to_read])
+                .context("read device for hash")?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            remaining -= n as u64;
+        }
+    }
+
+    let _ = child.wait();
+    let device_hash = hasher.finalize();
+
+    Ok(source_hash == device_hash)
 }
 
 fn collect_mountpoints(dev: &crate::device::LsblkDevice, mounts: &mut Vec<String>) {
